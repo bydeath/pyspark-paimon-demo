@@ -46,7 +46,7 @@
 
 ## **4\. 仓库结构**
 
-* paimon\_incremental\_pipeline.py: 核心批处理逻辑脚本。  
+* paimon_t1_wide_table_sync.py: 核心批处理逻辑脚本。  
 * paimon\_warehouse/: (自动生成) Paimon 元数据与数据文件存储目录。
 
 ## **5\. 免责声明与注意事项**
