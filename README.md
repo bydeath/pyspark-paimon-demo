@@ -6,7 +6,7 @@
 
 * **Apache Paimon (1.3.1)**：提供数据湖存储、LSM-Tree 索引及快照管理。  
 * **Apache Spark (3.5.x)**：负责分布式批处理计算及 ETL 逻辑。  
-* **Python (3.12.3)**：流水线调度与任务控制。
+* **Python (3.x)**：流水线调度与任务控制。
 
 ## **2\. 方案架构设计**
 
@@ -24,7 +24,69 @@
 * **数据生命周期锁定**：被 Tag 引用的快照及其关联的数据文件将受到保护，不会被 Paimon 的过期清理机制回收，确保了增量链路的稳定性。  
 * **自动回收机制**：内置 cleanup\_old\_tags 函数，根据预设的保留阈值自动清理过期 Tag，释放存储空间。
 
-### **2.3 数据处理流程**
+### **2.3 核心逻辑图解**
+
+#### **图 1：总体架构与流转图**
+
+展示了从 ODS 增量日志提取，到关系映射关联，最后通过 Partial-Update 引擎汇聚宽表的总体流程。
+```mermaid
+graph TD
+    subgraph ODS_Layer ["ODS 层"]
+        ODS_A[("ODS_A 事实表<br/>changelog: none")]
+        ODS_C[("ODS_C 维度表<br/>changelog: none")]
+    end
+
+    subgraph Spark_Process ["Spark T+1 批处理流"]
+        ReadA["读取 ODS_A 增量快照"]
+        ReadC["读取 ODS_C 增量快照"]
+        JoinDim["事实关联最新维度"]
+        JoinMap["维度增量关联映射表<br/>展开受影响的事实主键"]
+    end
+
+    subgraph DWS_DWD_Layer ["DWS / DWD 层"]
+        MAP[("关系映射表 MAP<br/>复合主键去重")]
+        DWD[("DWD 宽表<br/>Partial-Update 引擎")]
+    end
+
+    %% ODS_A 链路
+    ODS_A -- "提取增量" --> ReadA
+    ReadA --> JoinDim
+    JoinDim -- "1.写入事实列" --> DWD
+    JoinDim -- "2.维护关联关系" --> MAP
+
+    %% ODS_C 链路
+    ODS_C -- "提取增量" --> ReadC
+    ReadC --> JoinMap
+    MAP -. "提供事实主键" .-> JoinMap
+    JoinMap -- "3.仅更新维度列" --> DWD
+```
+#### **图 2：基于 Tag 的增量游标控制逻辑**
+
+展示了系统如何通过内部元数据表 $tags 和 $snapshots，实现精准区间截取与 Exactly-Once 语义保障。
+```mermaid
+graph TD
+    Start(("启动定时任务")) --> GetLastSnap["查询 $tags 系统表<br/>获取上次执行游标: last_snap"]
+    GetLastSnap --> GetLatestSnap["查询 $snapshots 系统表<br/>获取当前最新快照: latest_snap"]
+
+    GetLatestSnap --> Check{"游标区间比对"}
+
+    Check -- "latest_snap 为空" --> ExitNoData(("退出: 表无数据"))
+    Check -- "last_snap == latest_snap" --> ExitNoChange(("退出: 今日无新增"))
+    Check -- "last_snap 为空" --> ReadFull["首次运行<br/>执行全量读取"]
+    Check -- "last_snap < latest_snap" --> ReadInc["执行精准增量读取<br/>区间: (last_snap, latest_snap]"]
+
+    ReadFull --> Process["Spark 业务处理<br/>写入目标 DWD 宽表"]
+    ReadInc --> Process
+
+    Process --> Success{"写入是否成功?"}
+    Success -- "失败/异常" --> Error(("任务失败, 抛出异常<br/>第二天重试时自动回滚位点"))
+    
+    Success -- "成功" --> CreateTag["调用 sys.create_tag<br/>将 latest_snap 锁定为新 Tag"]
+    CreateTag --> CleanTag["调用 sys.delete_tag<br/>清理超出保留阈值的过期 Tag"]
+    CleanTag --> End(("任务完美结束"))
+
+```
+### **2.4 数据处理流程**
 
 1. **事实驱动同步**：捕获 ODS 事实表增量，关联维度表最新状态写入 DWD，并维护关系映射表。  
 2. **维度驱动回填**：捕获 ODS 维度表增量，通过映射表定位受影响的事实记录，仅回填 DWD 中的维度属性列。  
@@ -42,11 +104,11 @@
 1. 修改脚本中的 paimon\_spark\_jar 变量，指向您的 JAR 包物理路径。  
 2. 配置 warehouse\_path，在生产环境下建议指向 HDFS 或 S3 路径。  
 3. 执行脚本：  
-   python paimon\_incremental\_pipeline.py
+   python paimon\_t1\_wide\_table\_sync.py
 
 ## **4\. 仓库结构**
 
-* paimon_t1_wide_table_sync.py: 核心批处理逻辑脚本。  
+* paimon\_t1\_wide\_table\_sync.py: 核心批处理逻辑脚本。  
 * paimon\_warehouse/: (自动生成) Paimon 元数据与数据文件存储目录。
 
 ## **5\. 免责声明与注意事项**
