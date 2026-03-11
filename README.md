@@ -31,35 +31,40 @@
 展示了从 ODS 增量日志提取，到关系映射关联，最后通过 Partial-Update 引擎汇聚宽表的总体流程。
 ```mermaid
 graph TD
-    subgraph ODS_Layer ["ODS 层"]
-        ODS_A[("ODS_A 事实表<br/>changelog: none")]
-        ODS_C[("ODS_C 维度表<br/>changelog: none")]
+    subgraph ODS_Layer ["ODS 数据源层 (Changelog: none)"]
+        ODS_A[("ods_table_a<br/>(事实表)")]
+        DIM_P[("dim_policy<br/>(维度表)")]
     end
 
-    subgraph Spark_Process ["Spark T+1 批处理流"]
-        ReadA["读取 ODS_A 增量快照"]
-        ReadC["读取 ODS_C 增量快照"]
-        JoinDim["事实关联最新维度"]
-        JoinMap["维度增量关联映射表<br/>展开受影响的事实主键"]
+    subgraph Spark_Processing ["Spark T+1 批处理计算层"]
+        Read_A["读取 ods_table_a 增量快照"]
+        Read_C["读取 dim_policy 增量快照"]
+        
+        Join_A_Dim["增量事实 关联 最新维度"]
+        Join_C_Map["增量维度 关联 映射表<br/>(定位受影响的 serial_no)"]
     end
 
-    subgraph DWS_DWD_Layer ["DWS / DWD 层"]
-        MAP[("关系映射表 MAP<br/>复合主键去重")]
-        DWD[("DWD 宽表<br/>Partial-Update 引擎")]
+    subgraph Storage_Layer ["DWS / DWD 目标存储层"]
+        MAP[("map_policy_to_group<br/>(关系映射表)")]
+        DWD[("dwd_wide_fact<br/>(宽表 / partial-update)")]
     end
 
-    %% ODS_A 链路
-    ODS_A -- "提取增量" --> ReadA
-    ReadA --> JoinDim
-    JoinDim -- "1.写入事实列" --> DWD
-    JoinDim -- "2.维护关联关系" --> MAP
+    %% 事实表处理流
+    ODS_A -- "1. 提取 T+1 增量" --> Read_A
+    Read_A --> Join_A_Dim
+    Join_A_Dim -- "2a. 写入事实与维度列" --> DWD
+    Join_A_Dim -- "2b. 维护外键关系" --> MAP
 
-    %% ODS_C 链路
-    ODS_C -- "提取增量" --> ReadC
-    ReadC --> JoinMap
-    MAP -. "提供事实主键" .-> JoinMap
-    JoinMap -- "3.仅更新维度列" --> DWD
+    %% 维度表处理流
+    DIM_P -- "3. 提取 T+1 增量" --> Read_C
+    Read_C --> Join_C_Map
+    MAP -. "提供历史 serial_no" .-> Join_C_Map
+    Join_C_Map -- "4. 仅写入维度列 (事实列置为 NULL)" --> DWD
+
+    %% 最终物理对齐
+    DWD -. "5. 任务末尾执行 Full Compaction<br/>合并 Partial 字段" .-> DWD
 ```
+
 #### **图 2：基于 Tag 的增量游标控制逻辑**
 
 展示了系统如何通过内部元数据表 $tags 和 $snapshots，实现精准区间截取与 Exactly-Once 语义保障。
